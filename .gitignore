@@ -1,6 +1,6 @@
 # DEIT-III
 DEIT-III/datasets_fact/*
-DEIT-III/models*
+#DEIT-III/models*
 
 # DINOV2
 DINOV2/dinov2_vitl14_pretrain.pth
