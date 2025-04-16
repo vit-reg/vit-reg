@@ -1,3 +1,9 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 
 def show_artifacts_paper(
     test_model: nn.Module,
@@ -19,24 +25,28 @@ def show_artifacts_paper(
     else:
         output_norms = output.norm(dim=-1)[1:]
 
-    fig, ax = plt.subplots(figsize=(8, 8))  
-    im = ax.imshow(output_norms.reshape(shape[0], shape[1]).detach().numpy(), cmap="viridis")
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(
+        output_norms.reshape(shape[0], shape[1]).detach().numpy(), cmap="viridis"
+    )
     ax.axis("off")
-    #divider = make_axes_locatable(ax)
-    #cax = divider.append_axes("right", size="5%", pad=0.05)
-    #cbar = plt.colorbar(im, cax=cax)
-    #cbar.set_label("Norm Values")
+    # divider = make_axes_locatable(ax)
+    # cax = divider.append_axes("right", size="5%", pad=0.05)
+    # cbar = plt.colorbar(im, cax=cax)
+    # cbar.set_label("Norm Values")
     plt.show()
 
     plt.figure(figsize=(8, 8))
     plt.hist(output_norms.detach().numpy(), bins=50, color="blue", alpha=0.7)
     plt.xlabel("Norm Values")
     plt.ylabel("Frequency")
-    #plt.title("Histogram of Norm Values")
+    # plt.title("Histogram of Norm Values")
     plt.show()
 
     print("Attention maps for the last Attention Head")
-    attn_map_mean = test_model.blocks[num_blocks - 1].attn.attn_map.squeeze(0).mean(dim=0)
+    attn_map_mean = (
+        test_model.blocks[num_blocks - 1].attn.attn_map.squeeze(0).mean(dim=0)
+    )
 
     if discard_tokens > 0:
         attn_map_mean = attn_map_mean[token][1:-discard_tokens]
@@ -45,20 +55,24 @@ def show_artifacts_paper(
     if log_scale:
         attn_map_mean = torch.log(attn_map_mean + 1e-6)
 
-    fig, ax = plt.subplots(figsize=(8, 8))  
-    im = ax.imshow(attn_map_mean.reshape(shape[0], shape[1]).detach().numpy(), cmap="viridis")
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(
+        attn_map_mean.reshape(shape[0], shape[1]).detach().numpy(), cmap="viridis"
+    )
     ax.axis("off")
-    #divider = make_axes_locatable(ax)
-    #cax = divider.append_axes("right", size="5%", pad=0.05)
-    #cbar = plt.colorbar(im, cax=cax)
-    #cbar.set_label("CLS Attention Map")
+    # divider = make_axes_locatable(ax)
+    # cax = divider.append_axes("right", size="5%", pad=0.05)
+    # cbar = plt.colorbar(im, cax=cax)
+    # cbar.set_label("CLS Attention Map")
     plt.show()
 
     print("All attention maps")
 
     num_cols = 6
-    num_rows = (num_blocks + num_cols - 1) // num_cols 
-    fig, axes = plt.subplots(num_rows, num_cols, figsize=(8 * num_cols // 6, 8 * num_rows // 6)) 
+    num_rows = (num_blocks + num_cols - 1) // num_cols
+    fig, axes = plt.subplots(
+        num_rows, num_cols, figsize=(8 * num_cols // 6, 8 * num_rows // 6)
+    )
 
     axes = axes.flatten()
 

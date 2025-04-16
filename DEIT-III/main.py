@@ -2,31 +2,27 @@
 # All rights reserved.
 import argparse
 import datetime
-import numpy as np
-import time
-import torch
-import torch.backends.cudnn as cudnn
 import json
-
+import time
 from pathlib import Path
 
-from timm.data import Mixup
-from timm.models import create_model
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-from timm.scheduler import create_scheduler
-from timm.optim import create_optimizer
-from timm.utils import NativeScaler, get_state_dict, ModelEma
-
-from datasets import build_dataset
-from engine import train_one_epoch, evaluate
-from losses import DistillationLoss
-from samplers import RASampler
-from augment import new_data_aug_generator
-
 import models
-import models_v2
-
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
 import utils
+from augment import new_data_aug_generator
+from datasets import build_dataset
+from engine import evaluate, evaluate_segmentation, train_one_epoch
+from losses import DistillationLoss
+from models_v2 import segmentation_deit_small_patch16_LS_reg
+from samplers import RASampler
+from timm.data import Mixup
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from timm.models import create_model
+from timm.optim import create_optimizer
+from timm.scheduler import create_scheduler
+from timm.utils import ModelEma, NativeScaler, get_state_dict
 
 
 def get_args_parser():
@@ -166,12 +162,15 @@ def get_args_parser():
     parser.add_argument('--exp_soft_decay', action='store_true', help='L2 weight decay with exponential soft decay')
     parser.add_argument('--cos_decay', action='store_true', help='L2 weight decay with cosine decay')
     parser.add_argument('--step_decay', action='store_true', help='L2 weight decay with step decay')
+    ################## SEGMENTATION ##################
+    parser.add_argument('--segmentation', action='store_true', help='use segmentation head')
+    parser.add_argument('--segmentation-classes', type=int, default=150, help='number of segmentation classes')
     ######################################################################################
-    
+
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
+    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'ADE20K'],
                         type=str, help='Image Net dataset path')
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
@@ -270,7 +269,7 @@ def main(args):
     )
 
     mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    # mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
     # NOTE: mixup_fn not used
     # if mixup_active:
     #     mixup_fn = Mixup(
@@ -279,20 +278,29 @@ def main(args):
     #         label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
     print(f"Creating model: {args.model}")
-    model = create_model(
-        args.model,
-        pretrained=args.reg_use_pretrained, # NOTE: was originally set to False
-        pretrained_21k = args.pretrained_21k,
-        num_classes=args.nb_classes,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        img_size=args.input_size,
-        num_registers=args.num_registers,
-    )
+    if args.segmentation:
+        # NOTE: nasty but create_model did not work bc of the shape mismatch in the head
+        model = segmentation_deit_small_patch16_LS_reg(
+            pretrained=args.reg_use_pretrained,
+            img_size=args.input_size,
+            pretrained_21k=args.pretrained_21k,
+            num_registers=args.num_registers,
+        )
+
+    else:
+        model = create_model(
+            args.model,
+            pretrained=args.reg_use_pretrained, # NOTE: was originally set to False
+            pretrained_21k = args.pretrained_21k,
+            num_classes=args.nb_classes,
+            drop_rate=args.drop,
+            drop_path_rate=args.drop_path,
+            drop_block_rate=None,
+            img_size=args.input_size,
+            num_registers=args.num_registers,
+        )
     print(">"*20, "MODEL CREATED!")
 
-                    
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -355,17 +363,35 @@ def main(args):
     ####################################### F A C T #######################################
     # freeze specified layers if pretrained and freeze_layers > 0
     if args.freeze_layers > 0: # and args.reg_use_pretrained:
-        for param in model.patch_embed.parameters():
-            param.requires_grad = False
-        print(">"*20, "Froze the patch embeddings.")
-        num_blocks = len(model.blocks)
-        freeze_until = min(args.freeze_layers, num_blocks)
-        for block_idx in range(freeze_until):
-            for param in model.blocks[block_idx].parameters():
+        if args.segmentation: # NOTE: segmentation model (added .vit)
+            for param in model.vit.patch_embed.parameters():
                 param.requires_grad = False
-        print(">"*20, f"Froze {freeze_until} out of {num_blocks} layers of the model.")
-    ######################################################################################
+            
+            if not model.vit.use_norm_layer:
+                for param in model.vit.norm.parameters():
+                    param.requires_grad = False
 
+            print(">"*20, "Froze the patch embeddings.")
+            num_blocks = len(model.vit.blocks)
+            freeze_until = min(args.freeze_layers, num_blocks)
+            for block_idx in range(freeze_until):
+                for param in model.vit.blocks[block_idx].parameters():
+                    param.requires_grad = False
+            print(">"*20, f"Froze {freeze_until} out of {num_blocks} layers of the model.")
+            # freeze linear head for cls:
+            for param in model.vit.head.parameters():
+                param.requires_grad = False
+        else:
+            for param in model.patch_embed.parameters():
+                param.requires_grad = False
+            print(">"*20, "Froze the patch embeddings.")
+            num_blocks = len(model.blocks)
+            freeze_until = min(args.freeze_layers, num_blocks)
+            for block_idx in range(freeze_until):
+                for param in model.blocks[block_idx].parameters():
+                    param.requires_grad = False
+            print(">"*20, f"Froze {freeze_until} out of {num_blocks} layers of the model.")
+    ######################################################################################
     model.to(device)
 
     model_ema = None
@@ -391,10 +417,13 @@ def main(args):
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
 
-    criterion = LabelSmoothingCrossEntropy()
+    # criterion = LabelSmoothingCrossEntropy()
 
     # NOTE: try with CrossEntropyLoss first
-    criterion = torch.nn.CrossEntropyLoss()
+    if args.segmentation:
+        criterion = torch.nn.CrossEntropyLoss(ignore_index=255)
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
     # if mixup_active:
     #     # smoothing is handled with mixup label transform
     #     criterion = SoftTargetCrossEntropy()
@@ -467,7 +496,7 @@ def main(args):
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn,
-            set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
+            set_training_mode=args.train_mode, # keep in eval mode for deit finetuning / train mode for training and deit III finetuning 
             args = args,
         )
 
@@ -485,35 +514,54 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
              
+        if args.segmentation:
+            test_stats = evaluate_segmentation(data_loader_val, model, device, args.segmentation_classes)
+            print(f"mIoU of the network on the {len(dataset_val)} test images: {test_stats['mIoU']}")
 
-        test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        
-        if max_accuracy < test_stats["acc1"]:
-            max_accuracy = test_stats["acc1"]
-            if args.output_dir:
-                checkpoint_paths = [output_dir / 'best_checkpoint.pth']
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'model_ema': get_state_dict(model_ema),
-                        'scaler': loss_scaler.state_dict(),
-                        'args': args,
-                    }, checkpoint_path)
+            #  NOTE: use max_accuracy to store max mIoU
+            if max_accuracy < test_stats["mIoU"]:
+                max_accuracy = test_stats["mIoU"]
+                if args.output_dir:
+                    checkpoint_paths = [output_dir / 'best_checkpoint.pth']
+                    for checkpoint_path in checkpoint_paths:
+                        utils.save_on_master({
+                            'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'model_ema': get_state_dict(model_ema),
+                            'scaler': loss_scaler.state_dict(),
+                            'args': args,
+                        }, checkpoint_path)
             
-        print(f'Max accuracy: {max_accuracy:.2f}%')
+            print(f'Max mIoU: {max_accuracy:.5f}')
+
+        else:
+            test_stats = evaluate(data_loader_val, model, device)
+            print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+
+            if max_accuracy < test_stats["acc1"]:
+                max_accuracy = test_stats["acc1"]
+                if args.output_dir:
+                    checkpoint_paths = [output_dir / 'best_checkpoint.pth']
+                    for checkpoint_path in checkpoint_paths:
+                        utils.save_on_master({
+                            'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'model_ema': get_state_dict(model_ema),
+                            'scaler': loss_scaler.state_dict(),
+                            'args': args,
+                        }, checkpoint_path)
+
+            print(f'Max accuracy: {max_accuracy:.2f}%')
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
-        
-        
-        
-        
+                    **{f'test_{k}': v for k, v in test_stats.items()},
+                    'epoch': epoch,
+                    'n_parameters': n_parameters}
+
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")

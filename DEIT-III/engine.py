@@ -12,7 +12,8 @@ import utils
 from losses import DistillationLoss
 from timm.data import Mixup
 from timm.utils import ModelEma, accuracy
-
+import numpy as np
+from sklearn.metrics import confusion_matrix
 
 def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -27,6 +28,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
     
     if args.cosub:
         criterion = torch.nn.BCEWithLogitsLoss()
+
+    if args.segmentation:
+        criterion = torch.nn.CrossEntropyLoss(ignore_index=255)
         
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device, non_blocking=True)
@@ -40,10 +44,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             
         if args.bce_loss:
             targets = targets.gt(0.0).type(targets.dtype)
-         
+        
         with torch.cuda.amp.autocast():
             outputs = model(samples)
-            if not args.cosub:
+            
+            if args.segmentation:
+                loss = criterion(outputs, targets)
+            elif not args.cosub:   
                 loss = criterion(samples, outputs, targets)
             else:
                 outputs = torch.split(outputs, outputs.shape[0]//2, dim=0)
@@ -59,28 +66,35 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             # [cls, patches, regs]
             discard_tokens = args.num_registers
             # not that neat but works both locally and on the cluster
-            if discard_tokens > 0:
-                try:
-                    num_blocks = model.module.get_num_layers()-1
-                    final_output = model.module.block_output[f"block{num_blocks}"][:, 1:-discard_tokens]
-                    # final_output = model.module.block_output['final'][:, 1:-discard_tokens]
-                except:
-                    num_blocks = model.get_num_layers()-1
-                    final_output = model.block_output[f"block{num_blocks}"][:, 1:-discard_tokens]
-                    # final_output = model.block_output['final'][:, 1:-discard_tokens]
+            if args.segmentation:
+                if discard_tokens > 0:
+                    final_output = outputs[:, 1:-discard_tokens, :]
+                else:
+                    final_output = outputs[:, 1:, :]
+
             else:
-                try:
-                    num_blocks = model.module.get_num_layers()-1
-                    final_output = model.module.block_output[f"block{num_blocks}"][:, 1:]
-                except:
-                    num_blocks = model.get_num_layers()-1
-                    final_output = model.block_output[f"block{num_blocks}"][:, 1:]
+                if discard_tokens > 0:
+                    try:
+                        num_blocks = model.module.get_num_layers()-1
+                        final_output = model.module.block_output[f"block{num_blocks}"][:, 1:-discard_tokens]
+                        # final_output = model.module.block_output['final'][:, 1:-discard_tokens]
+                    except:
+                        num_blocks = model.get_num_layers()-1
+                        final_output = model.block_output[f"block{num_blocks}"][:, 1:-discard_tokens]
+                        # final_output = model.block_output['final'][:, 1:-discard_tokens]
+                else:
+                    try:
+                        num_blocks = model.module.get_num_layers()-1
+                        final_output = model.module.block_output[f"block{num_blocks}"][:, 1:]
+                    except:
+                        num_blocks = model.get_num_layers()-1
+                        final_output = model.block_output[f"block{num_blocks}"][:, 1:]
             
             output_norms = final_output.norm(dim=-1)
             if args.l2_decay:
                 l2_norm_loss = args.l2_weight / (epoch + 1) * output_norms.mean()
             elif args.exp_decay:
-                l2_norm_loss = args.l2_weight ** ((epoch // 10) + 1) * output_norms.mean()
+                l2_norm_loss = args.l2_weight ** ((epoch % 10) + 1) * output_norms.mean()
             elif args.exp_soft_decay:
                 l2_norm_loss = args.l2_weight ** ((epoch / 10) + 1) * output_norms.mean()
             elif args.cos_decay:
@@ -157,3 +171,68 @@ def evaluate(data_loader, model, device):
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+def compute_miou(preds, labels, num_classes, ignore_index=255) -> float:
+    mask = labels != ignore_index
+    preds = preds[mask].flatten()
+    labels = labels[mask].flatten()
+
+    cm = confusion_matrix(labels, preds, labels=list(range(num_classes)))
+    intersection = np.diag(cm)
+    union = np.sum(cm, axis=1) + np.sum(cm, axis=0) - intersection
+
+    iou = np.zeros(num_classes)
+    valid = union > 0
+    iou[valid] = intersection[valid] / union[valid]
+
+    miou = iou[valid].mean()
+    return miou
+
+
+@torch.no_grad()
+def evaluate_segmentation(data_loader, model, device, num_classes):
+    """Evaluate the model on the segmentation dataset with mIoU and loss."""
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=255)
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = "Test:"
+
+    model.eval()
+
+    all_preds = []
+    all_labels = []
+
+    for images, targets in metric_logger.log_every(data_loader, 10, header):
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast():
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+
+        # Convert logits to predicted class indices
+        preds = outputs.argmax(dim=1)
+
+        # Accumulate predictions and labels for mIoU
+        all_preds.append(preds.cpu())
+        all_labels.append(targets.cpu())
+
+        metric_logger.update(loss=loss.item())
+
+    # Stack all predictions and labels
+    all_preds = torch.cat(all_preds, dim=0).numpy()
+    all_labels = torch.cat(all_labels, dim=0).numpy()
+
+    # Compute mIoU
+    miou = compute_miou(all_preds, all_labels, num_classes=num_classes)
+
+    metric_logger.synchronize_between_processes()
+    print(
+        "* mIoU {miou:.4f} loss {loss.global_avg:.4f}".format(
+            miou=miou, loss=metric_logger.loss
+        )
+    )
+
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats["mIoU"] = miou
+    return stats
